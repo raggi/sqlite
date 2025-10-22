@@ -25,6 +25,37 @@
 typedef unsigned char u8;
 typedef unsigned int u32;
 
+/*
+** Constants derived from SQLite file format specification
+** Reference: https://www.sqlite.org/fileformat.html
+*/
+
+/* Database header offsets (Section 1.3) */
+#define SQLITE_HEADER_SIZE           100   /* Size of database file header */
+#define SQLITE_HEADER_MAGIC_OFFSET   0     /* Offset to magic string */
+#define SQLITE_HEADER_MAGIC_SIZE     16    /* Size of magic string */
+#define SQLITE_HEADER_PAGESIZE_OFFSET 16   /* Offset to page size (2 bytes) */
+#define SQLITE_HEADER_FREELIST_OFFSET 32   /* Offset to first freelist trunk page */
+#define SQLITE_HEADER_FREELIST_COUNT  36   /* Offset to total freelist page count */
+
+/* Special page size values (Section 1.3.2) */
+#define SQLITE_PAGESIZE_MAGIC_65536  1     /* Magic value representing 65536 bytes */
+#define SQLITE_PAGESIZE_DEFAULT      1024  /* Default page size for value 0 */
+#define SQLITE_PAGESIZE_MAX          65536 /* Maximum page size */
+
+/* Freelist structure offsets (Section 1.5) */
+#define FREELIST_TRUNK_NEXT_OFFSET   0     /* Next trunk page pointer (4 bytes) */
+#define FREELIST_TRUNK_COUNT_OFFSET  4     /* Leaf page count (4 bytes) */
+#define FREELIST_TRUNK_LEAVES_OFFSET 8     /* Start of leaf page array */
+#define FREELIST_TRUNK_HEADER_SIZE   8     /* Size of trunk page header */
+#define FREELIST_LEAF_ENTRY_SIZE     4     /* Size of each leaf page entry */
+
+/* Cycle detection limit */
+#define MAX_FREELIST_CYCLE_CHECK     10000 /* Maximum pages to track for cycles */
+
+/* Formatting constants */
+#define LEAF_PAGES_PER_LINE          8     /* Leaf pages to display per line */
+
 /* Global state */
 static struct {
   int fd;           /* File descriptor */
@@ -84,22 +115,28 @@ static int readHeader(void){
     return 1;
   }
   
-  n = read(g.fd, header, 100);
-  if( n != 100 ){
+  n = read(g.fd, header, SQLITE_HEADER_SIZE);
+  if( n != SQLITE_HEADER_SIZE ){
     fprintf(stderr, "ERROR: cannot read database header\n");
     return 1;
   }
   
-  /* Check magic string */
-  if( memcmp(header, "SQLite format 3\000", 16) != 0 ){
+  /* Check magic string "SQLite format 3\0" (Section 1.3.1) */
+  if( memcmp(header + SQLITE_HEADER_MAGIC_OFFSET, 
+             "SQLite format 3\000", SQLITE_HEADER_MAGIC_SIZE) != 0 ){
     fprintf(stderr, "ERROR: not a SQLite database file\n");
     return 1;
   }
   
-  /* Extract page size */
-  g.pagesize = (header[16]<<8) | (header[17]<<16);
-  if( g.pagesize==0 ) g.pagesize = 65536;
-  if( g.pagesize==1 ) g.pagesize = 65536;
+  /* Extract page size (Section 1.3.2) - big-endian 16-bit at offset 16 */
+  g.pagesize = (header[SQLITE_HEADER_PAGESIZE_OFFSET]<<8) | 
+                header[SQLITE_HEADER_PAGESIZE_OFFSET+1];
+  if( g.pagesize == SQLITE_PAGESIZE_MAGIC_65536 ){
+    g.pagesize = SQLITE_PAGESIZE_MAX;  /* Special encoding for 65536 */
+  }
+  if( g.pagesize == 0 ){
+    g.pagesize = SQLITE_PAGESIZE_DEFAULT;  /* Default for legacy files */
+  }
   
   /* Get file size to calculate max page */
   fileSize = lseek(g.fd, 0, SEEK_END);
@@ -109,9 +146,9 @@ static int readHeader(void){
   }
   g.mxPage = (u32)((fileSize + g.pagesize - 1) / g.pagesize);
   
-  /* Extract freelist information */
-  g.firstFreelist = get32(header + 32);
-  g.freelistCount = get32(header + 36);
+  /* Extract freelist information (Section 1.3.8) */
+  g.firstFreelist = get32(header + SQLITE_HEADER_FREELIST_OFFSET);
+  g.freelistCount = get32(header + SQLITE_HEADER_FREELIST_COUNT);
   
   return 0;
 }
@@ -160,7 +197,7 @@ static void addFreelistPage(u32 pgno, int isTrunk, u32 parent){
 static int walkFreelist(void){
   u32 pgno = g.firstFreelist;
   u32 trunkNum = 0;
-  u32 visited[10000]; /* Guard against cycles */
+  u32 visited[MAX_FREELIST_CYCLE_CHECK]; /* Guard against cycles */
   u32 visitCount = 0;
   
   printf("Walking freelist starting at page %u...\n", pgno);
@@ -179,7 +216,7 @@ static int walkFreelist(void){
         return 1;
       }
     }
-    if( visitCount < 10000 ){
+    if( visitCount < MAX_FREELIST_CYCLE_CHECK ){
       visited[visitCount++] = pgno;
     }
     
@@ -190,26 +227,28 @@ static int walkFreelist(void){
     trunkNum++;
     addFreelistPage(pgno, 1, 0);
     
-    nextTrunk = get32(page);
-    numLeaves = get32(page + 4);
+    /* Read trunk page structure (Section 1.5) */
+    nextTrunk = get32(page + FREELIST_TRUNK_NEXT_OFFSET);
+    numLeaves = get32(page + FREELIST_TRUNK_COUNT_OFFSET);
     
     printf("Trunk page %u (trunk #%u):\n", pgno, trunkNum);
     printf("  Next trunk: %u\n", nextTrunk);
     printf("  Leaf count: %u\n", numLeaves);
     
-    /* Sanity check leaf count */
-    if( numLeaves > (g.pagesize - 8) / 4 ){
+    /* Sanity check leaf count - max entries that fit after 8-byte header */
+    u32 maxLeaves = (g.pagesize - FREELIST_TRUNK_HEADER_SIZE) / FREELIST_LEAF_ENTRY_SIZE;
+    if( numLeaves > maxLeaves ){
       fprintf(stderr, "ERROR: trunk page %u has invalid leaf count %u (max %u)\n",
-              pgno, numLeaves, (g.pagesize - 8) / 4);
-      numLeaves = (g.pagesize - 8) / 4;
+              pgno, numLeaves, maxLeaves);
+      numLeaves = maxLeaves;
     }
     
     /* Process leaf pages */
     if( numLeaves > 0 ){
       printf("  Leaf pages:");
       for(i=0; i<numLeaves; i++){
-        u32 leafPgno = get32(page + 8 + i*4);
-        if( i % 8 == 0 ){
+        u32 leafPgno = get32(page + FREELIST_TRUNK_LEAVES_OFFSET + i*FREELIST_LEAF_ENTRY_SIZE);
+        if( i % LEAF_PAGES_PER_LINE == 0 ){
           printf("\n    ");
         }
         printf("%u ", leafPgno);
