@@ -99,6 +99,7 @@ static struct {
   u32 mxPage;       /* Maximum page number */
   u32 firstFreelist; /* First freelist trunk page */
   u32 freelistCount; /* Freelist count from header */
+  u32 reservedSpace; /* Reserved space at end of each page */
   u8 *inFreelist;   /* Bitmap: is page in freelist? */
   u8 *inUse;        /* Bitmap: is page in use by btree? */
 } g;
@@ -182,6 +183,9 @@ static int readHeader(void){
   /* Extract freelist information (Section 1.3.8) */
   g.firstFreelist = get32(header + SQLITE_HEADER_FREELIST_OFFSET);
   g.freelistCount = get32(header + SQLITE_HEADER_FREELIST_COUNT);
+
+  /* Extract reserved space per page (Section 1.3.4) */
+  g.reservedSpace = header[SQLITE_HEADER_RESERVED_OFFSET];
 
   free(header);
   return 0;
@@ -338,21 +342,39 @@ static void walkBtree(u32 pgno, int depth){
       if( cellOffset < g.pagesize - CHILD_POINTER_SIZE ){
         u8 *cell = page + cellOffset;
         i64 nPayload;
+        i64 rowid;
         int n;
 
-        /* Skip rowid varint for table leaf (not present in index leaf) */
-        if( pageType == BTREE_LEAF_TABLE ){
-          n = decodeVarint(cell, &nPayload);
-          cell += n;
-        }
-
-        /* Get payload size */
+        /* Table leaf cell format (Section 1.6):
+         *   1. Payload size (varint)
+         *   2. Rowid (varint)
+         *   3. Payload data
+         * Index leaf cell format:
+         *   1. Payload size (varint)
+         *   2. Payload data (no rowid)
+         */
+        
+        /* Get payload size - first varint in both table and index leaf cells */
         n = decodeVarint(cell, &nPayload);
         cell += n;
 
+        /* Skip rowid varint for table leaf (not present in index leaf) */
+        if( pageType == BTREE_LEAF_TABLE ){
+          n = decodeVarint(cell, &rowid);
+          cell += n;
+        }
+        
+        /* Validate payload size is reasonable before checking for overflow */
+        /* SQLite max BLOB/TEXT is ~2GB, but realistic cells are much smaller */
+        /* Use 1GB as upper bound to catch bogus varint decoding */
+        if( nPayload < 0 || nPayload > 1073741824 /* 1GB */ ){
+          /* Payload size is unreasonable - probably corrupt or misread varint */
+          continue;
+        }
+
         /* Check if there are overflow pages (Section 1.6) */
-        /* Note: reserved space is at offset 20 of page 1 header, not each page */
-        u32 usable = g.pagesize - page[SQLITE_HEADER_RESERVED_OFFSET];
+        /* Use reserved space from database header (Section 1.3.4) */
+        u32 usable = g.pagesize - g.reservedSpace;
         u32 maxLocal = usable - PAYLOAD_MAX_SUBTRACT;
         if( pageType == BTREE_LEAF_TABLE ){
           u32 minLocal = ((usable - PAYLOAD_USABLE_SUBTRACT) * PAYLOAD_MIN_FRACTION 
@@ -362,13 +384,16 @@ static void walkBtree(u32 pgno, int depth){
             u32 localSize = minLocal + ((nPayload - minLocal) % (usable - OVERFLOW_HEADER_SIZE));
             if( (u32)(cell - page + localSize + CHILD_POINTER_SIZE) <= g.pagesize ){
               u32 overflowPage = get32(cell + localSize);
-              /* Walk overflow chain */
-              while( overflowPage > 0 && overflowPage <= g.mxPage ){
-                markInUse(overflowPage);
-                u8 *ovfl = readPage(overflowPage);
-                if( !ovfl ) break;
-                overflowPage = get32(ovfl + OVERFLOW_NEXT_OFFSET);
-                free(ovfl);
+              /* Validate overflow page number before following it */
+              if( overflowPage > 0 && overflowPage <= g.mxPage ){
+                /* Walk overflow chain */
+                while( overflowPage > 0 && overflowPage <= g.mxPage ){
+                  markInUse(overflowPage);
+                  u8 *ovfl = readPage(overflowPage);
+                  if( !ovfl ) break;
+                  overflowPage = get32(ovfl + OVERFLOW_NEXT_OFFSET);
+                  free(ovfl);
+                }
               }
             }
           }
