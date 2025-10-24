@@ -1,6 +1,6 @@
 /*
 ** A utility for comprehensive SQLite database page accounting.
-** 
+**
 ** This tool provides a complete accounting of every page in the database:
 ** - Pages in freelist (trunk and leaf)
 ** - Pages in btrees (interior and leaf)
@@ -194,7 +194,7 @@ static int readHeader(void){
   if(!header) return 1;
 
   /* Check magic string */
-  if(memcmp(header + SQLITE_HEADER_MAGIC_OFFSET, 
+  if(memcmp(header + SQLITE_HEADER_MAGIC_OFFSET,
             "SQLite format 3\000", SQLITE_HEADER_MAGIC_SIZE) != 0){
     fprintf(stderr, "ERROR: not a SQLite database file\n");
     free(header);
@@ -202,7 +202,7 @@ static int readHeader(void){
   }
 
   /* Extract page size */
-  g.pagesize = (header[SQLITE_HEADER_PAGESIZE_OFFSET]<<8) | 
+  g.pagesize = (header[SQLITE_HEADER_PAGESIZE_OFFSET]<<8) |
                 header[SQLITE_HEADER_PAGESIZE_OFFSET+1];
   if(g.pagesize == SQLITE_PAGESIZE_MAGIC_65536){
     g.pagesize = SQLITE_PAGESIZE_MAX;
@@ -239,14 +239,14 @@ static int readHeader(void){
 /* Mark a page with its type and parent */
 static void markPage(u32 pgno, PageType type, u32 parent){
   if(pgno < 1 || pgno > g.mxPage) return;
-  
+
   /* If already marked, detect conflicts */
   if(g.pageTypes[pgno] != PAGE_UNKNOWN && g.pageTypes[pgno] != type){
     printf("⚠️  CONFLICT: Page %u marked as both %s (parent %u) and %s (parent %u)\n",
            pgno, pageTypeName(g.pageTypes[pgno]), g.pageParents[pgno],
            pageTypeName(type), parent);
   }
-  
+
   g.pageTypes[pgno] = type;
   g.pageParents[pgno] = parent;
 }
@@ -316,21 +316,32 @@ static int decodeVarint(const u8 *z, i64 *pVal){
   return 9;
 }
 
-/* Check if a page number should be a ptrmap page */
-static int isPtrmapPage(u32 pgno){
+/* Forward declaration */
+static int isValidPtrmapData(u8 *page);
+
+/* Check if a page number is at a ptrmap position */
+static int isPtrmapPosition(u32 pgno){
   u32 usableSize = g.pagesize - g.reservedSpace;
   u32 pagesPerPtrmap = usableSize / 5;  /* 5 bytes per entry */
   u32 firstPtrmap = pagesPerPtrmap + 1;
-  
+
   if(pgno == 1) return 0;
   if(pgno < firstPtrmap) return 0;
-  
+
   u32 offset = pgno - firstPtrmap;
   if(offset % (pagesPerPtrmap + 1) == 0){
     return 1;
   }
-  
+
   return 0;
+}
+
+/* Check if a page number should be a ptrmap page */
+static int isPtrmapPage(u32 pgno){
+  /* No ptrmap pages if auto-vacuum is disabled */
+  if(g.autoVacuum == 0) return 0;
+
+  return isPtrmapPosition(pgno);
 }
 
 /* Walk btree recursively */
@@ -346,9 +357,23 @@ static void walkBtree(u32 pgno, u32 parent, int depth){
   if(pgno < 1 || pgno > g.mxPage) return;
   if(g.pageTypes[pgno] != PAGE_UNKNOWN) return; /* Already visited */
   if(depth > MAX_BTREE_DEPTH) return;
-  
+
   /* Skip ptrmap pages - they're not part of btree */
   if(isPtrmapPage(pgno)) return;
+
+  /* Check if page is at ptrmap position but autovacuum is disabled */
+  if(g.autoVacuum == 0 && isPtrmapPosition(pgno)){
+    /* Read the page to check if it contains ptrmap data */
+    u8 *ptrmapCheck = readPage(pgno);
+    if(ptrmapCheck && isValidPtrmapData(ptrmapCheck)){
+      /* This looks like a ghost ptrmap page - count it but continue walking */
+      g.ptrmapGhostCount++;
+      free(ptrmapCheck);
+      /* Don't return - continue to process as normal page */
+    } else {
+      if(ptrmapCheck) free(ptrmapCheck);
+    }
+  }
 
   page = readPage(pgno);
   if(!page) return;
@@ -379,7 +404,7 @@ static void walkBtree(u32 pgno, u32 parent, int depth){
 
     /* Walk each cell's left child */
     for(i=0; i<nCell && i<g.pagesize/CELL_POINTER_SIZE; i++){
-      u32 cellOffset = (page[cellStart + i*CELL_POINTER_SIZE]<<8) | 
+      u32 cellOffset = (page[cellStart + i*CELL_POINTER_SIZE]<<8) |
                         page[cellStart + i*CELL_POINTER_SIZE + 1];
       if(cellOffset >= CHILD_POINTER_SIZE && cellOffset < g.pagesize){
         u32 childPage = get32(page + cellOffset);
@@ -392,12 +417,69 @@ static void walkBtree(u32 pgno, u32 parent, int depth){
     walkBtree(rightChild, pgno, depth + 1);
   }
 
+  /* Handle interior index pages - check for overflow */
+  if(pageType == BTREE_INTERIOR_INDEX){
+    cellStart = hdr + BTREE_HEADER_SIZE_INTERIOR;
+
+    for(i=0; i<nCell && i<g.pagesize/CELL_POINTER_SIZE; i++){
+      u32 cellOffset = (page[cellStart + i*CELL_POINTER_SIZE]<<8) |
+                        page[cellStart + i*CELL_POINTER_SIZE + 1];
+      if(cellOffset < g.pagesize - CHILD_POINTER_SIZE - CHILD_POINTER_SIZE){
+        u8 *cell = page + cellOffset;
+        i64 nPayload;
+        int n;
+
+        /* Skip child pointer (4 bytes) */
+        cell += CHILD_POINTER_SIZE;
+
+        /* Get payload size */
+        n = decodeVarint(cell, &nPayload);
+        cell += n;
+
+        /* Check for overflow pages */
+        if(nPayload > 0 && nPayload < 1073741824){
+          u32 usable = g.pagesize - g.reservedSpace;
+          u32 maxLocal;
+          u32 minLocal;
+          u32 localSize;
+
+          /* Interior index cell overflow calculation */
+          maxLocal = ((usable - 12) * 64 / 255) - 23;
+          minLocal = ((usable - 12) * 32 / 255) - 23;
+
+          if(nPayload > maxLocal){
+            u32 surplus = minLocal + ((nPayload - minLocal) % (usable - OVERFLOW_HEADER_SIZE));
+            if(surplus <= maxLocal){
+              localSize = surplus;
+            }else{
+              localSize = minLocal;
+            }
+            if((u32)(cell - page + localSize + CHILD_POINTER_SIZE) <= g.pagesize){
+              u32 overflowPage = get32(cell + localSize);
+
+              /* Walk overflow chain */
+              while(overflowPage > 0 && overflowPage <= g.mxPage){
+                if(g.pageTypes[overflowPage] != PAGE_UNKNOWN) break;
+                markPage(overflowPage, PAGE_OVERFLOW, pgno);
+
+                u8 *ovfl = readPage(overflowPage);
+                if(!ovfl) break;
+                overflowPage = get32(ovfl + OVERFLOW_NEXT_OFFSET);
+                free(ovfl);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   /* Handle leaf pages - check for overflow */
   if(pageType == BTREE_LEAF_TABLE || pageType == BTREE_LEAF_INDEX){
     cellStart = hdr + BTREE_HEADER_SIZE_LEAF;
 
     for(i=0; i<nCell && i<g.pagesize/CELL_POINTER_SIZE; i++){
-      u32 cellOffset = (page[cellStart + i*CELL_POINTER_SIZE]<<8) | 
+      u32 cellOffset = (page[cellStart + i*CELL_POINTER_SIZE]<<8) |
                         page[cellStart + i*CELL_POINTER_SIZE + 1];
       if(cellOffset < g.pagesize - CHILD_POINTER_SIZE){
         u8 *cell = page + cellOffset;
@@ -421,23 +503,28 @@ static void walkBtree(u32 pgno, u32 parent, int depth){
           u32 maxLocal;
           u32 minLocal;
           u32 localSize;
-          
+
           if(pageType == BTREE_LEAF_TABLE){
             /* Table b-tree leaf cell overflow calculation */
             maxLocal = usable - PAYLOAD_MAX_SUBTRACT;
-            minLocal = ((usable - PAYLOAD_USABLE_SUBTRACT) * PAYLOAD_MIN_FRACTION 
+            minLocal = ((usable - PAYLOAD_USABLE_SUBTRACT) * PAYLOAD_MIN_FRACTION
                         / PAYLOAD_DIVISOR) - PAYLOAD_MIN_SUBTRACT;
-            
+
             if(nPayload > maxLocal){
-              localSize = minLocal + ((nPayload - minLocal) % (usable - OVERFLOW_HEADER_SIZE));
+              u32 surplus = minLocal + ((nPayload - minLocal) % (usable - OVERFLOW_HEADER_SIZE));
+              if(surplus <= maxLocal){
+                localSize = surplus;
+              }else{
+                localSize = minLocal;
+              }
               if((u32)(cell - page + localSize + CHILD_POINTER_SIZE) <= g.pagesize){
                 u32 overflowPage = get32(cell + localSize);
-                
+
                 /* Walk overflow chain */
                 while(overflowPage > 0 && overflowPage <= g.mxPage){
                   if(g.pageTypes[overflowPage] != PAGE_UNKNOWN) break;
                   markPage(overflowPage, PAGE_OVERFLOW, pgno);
-                  
+
                   u8 *ovfl = readPage(overflowPage);
                   if(!ovfl) break;
                   overflowPage = get32(ovfl + OVERFLOW_NEXT_OFFSET);
@@ -450,17 +537,23 @@ static void walkBtree(u32 pgno, u32 parent, int depth){
             /* For index leaves: maxLocal = ((U-12)*64/255)-23 */
             maxLocal = ((usable - 12) * 64 / 255) - 23;
             minLocal = ((usable - 12) * 32 / 255) - 23;
-            
+
             if(nPayload > maxLocal){
-              localSize = minLocal + ((nPayload - minLocal) % (usable - OVERFLOW_HEADER_SIZE));
+              u32 surplus = minLocal + ((nPayload - minLocal) % (usable - OVERFLOW_HEADER_SIZE));
+              if(surplus <= maxLocal){
+                localSize = surplus;
+              }else{
+                localSize = minLocal;
+              }
+              
               if((u32)(cell - page + localSize + CHILD_POINTER_SIZE) <= g.pagesize){
                 u32 overflowPage = get32(cell + localSize);
-                
+
                 /* Walk overflow chain */
                 while(overflowPage > 0 && overflowPage <= g.mxPage){
                   if(g.pageTypes[overflowPage] != PAGE_UNKNOWN) break;
                   markPage(overflowPage, PAGE_OVERFLOW, pgno);
-                  
+
                   u8 *ovfl = readPage(overflowPage);
                   if(!ovfl) break;
                   overflowPage = get32(ovfl + OVERFLOW_NEXT_OFFSET);
@@ -526,17 +619,17 @@ static int isValidPtrmapData(u8 *page){
   u32 entriesPerPage = usableSize / 5;
   u32 i;
   int hasValidEntry = 0;
-  
+
   /* Check each 5-byte entry */
   for(i = 0; i < entriesPerPage; i++){
     u8 type = page[i * 5];
     u32 parent = get32(page + i * 5 + 1);
-    
+
     /* Type must be valid (1-5) or 0 (unused) */
     if(type > 5){
       return 0;  /* Invalid type byte */
     }
-    
+
     /* If type is non-zero, validate parent page */
     if(type != 0){
       hasValidEntry = 1;
@@ -546,7 +639,7 @@ static int isValidPtrmapData(u8 *page){
       }
     }
   }
-  
+
   /* A valid ptrmap should have at least some non-zero entries */
   return hasValidEntry;
 }
@@ -558,10 +651,10 @@ static void markPtrmapPages(void){
   u32 usableSize = g.pagesize - g.reservedSpace;
   u32 pagesPerPtrmap = usableSize / 5;
   u32 firstPtrmap = pagesPerPtrmap + 1;
-  
+
   g.ptrmapGhostCount = 0;
   g.ptrmapMissingCount = 0;
-  
+
   for(u32 pgno = firstPtrmap; pgno <= g.mxPage; pgno += (pagesPerPtrmap + 1)){
     /* Skip if this page is already classified (e.g., in freelist or btree) */
     if(g.pageTypes[pgno] != PAGE_UNKNOWN){
@@ -571,20 +664,20 @@ static void markPtrmapPages(void){
       }
       continue;
     }
-    
+
     /* Read the page and check if it contains valid ptrmap data */
     u8 *page = readPage(pgno);
     if(!page){
       continue;
     }
-    
+
     int isValid = isValidPtrmapData(page);
     free(page);
-    
+
     if(isValid){
       /* Found valid ptrmap data */
       markPage(pgno, PAGE_PTRMAP, 0);
-      
+
       if(g.autoVacuum == 0){
         /* Ghost ptrmap: autovacuum disabled but ptrmap page exists */
         g.ptrmapGhostCount++;
@@ -614,14 +707,14 @@ static int isAllZeros(const u8 *data, u32 len){
 static void classifyOrphanedPages(void){
   u32 i;
   g.orphanCount = 0;
-  
+
   for(i = 1; i <= g.mxPage; i++){
     if(g.pageTypes[i] != PAGE_UNKNOWN) continue;
-    
+
     /* Read the page to determine what type of orphan it is */
     u8 *page = readPage(i);
     if(!page) continue;
-    
+
     /* Check if empty */
     if(isAllZeros(page, g.pagesize)){
       g.pageTypes[i] = PAGE_ORPHAN_EMPTY;
@@ -629,11 +722,11 @@ static void classifyOrphanedPages(void){
       free(page);
       continue;
     }
-    
+
     /* Check page type byte */
     u8 pageType = page[0];
     u32 nextPage = get32(page);
-    
+
     if(pageType == 0x0d){
       g.pageTypes[i] = PAGE_ORPHAN_BTREE_LEAF_TABLE;
       g.orphanCount++;
@@ -653,7 +746,7 @@ static void classifyOrphanedPages(void){
     } else {
       /* Leave as PAGE_UNKNOWN */
     }
-    
+
     free(page);
   }
 }
@@ -665,11 +758,22 @@ static void printReport(void){
   u32 *unknownPages = NULL; /* Store all unknown pages */
   u32 numUnknown = 0;
   u32 unknownCapacity = 1000;
+  u32 *orphanedPages = NULL; /* Store all orphaned pages */
+  u32 numOrphaned = 0;
+  u32 orphanedCapacity = 1000;
 
   /* Allocate array for unknown pages */
   unknownPages = malloc(unknownCapacity * sizeof(u32));
   if(!unknownPages){
     fprintf(stderr, "ERROR: out of memory\n");
+    return;
+  }
+
+  /* Allocate array for orphaned pages */
+  orphanedPages = malloc(orphanedCapacity * sizeof(u32));
+  if(!orphanedPages){
+    fprintf(stderr, "ERROR: out of memory\n");
+    free(unknownPages);
     return;
   }
 
@@ -686,16 +790,37 @@ static void printReport(void){
         if(!newPages){
           fprintf(stderr, "ERROR: out of memory\n");
           free(unknownPages);
+          free(orphanedPages);
           return;
         }
         unknownPages = newPages;
       }
       unknownPages[numUnknown++] = i;
     }
+    /* Check if page is orphaned */
+    if(type == PAGE_ORPHAN_BTREE_INTERIOR_INDEX ||
+       type == PAGE_ORPHAN_BTREE_INTERIOR_TABLE ||
+       type == PAGE_ORPHAN_BTREE_LEAF_INDEX ||
+       type == PAGE_ORPHAN_BTREE_LEAF_TABLE ||
+       type == PAGE_ORPHAN_OVERFLOW ||
+       type == PAGE_ORPHAN_EMPTY){
+      if(numOrphaned >= orphanedCapacity){
+        orphanedCapacity *= 2;
+        u32 *newPages = realloc(orphanedPages, orphanedCapacity * sizeof(u32));
+        if(!newPages){
+          fprintf(stderr, "ERROR: out of memory\n");
+          free(unknownPages);
+          free(orphanedPages);
+          return;
+        }
+        orphanedPages = newPages;
+      }
+      orphanedPages[numOrphaned++] = i;
+    }
   }
 
   printf("\n=== PAGE ACCOUNTING REPORT ===\n\n");
-  
+
   printf("Database settings:\n");
   printf("  Page size:             %u bytes\n", g.pagesize);
   printf("  Auto-vacuum mode:      %u ", g.autoVacuum);
@@ -706,7 +831,7 @@ static void printReport(void){
     default: printf("(UNKNOWN)\n"); break;
   }
   printf("\n");
-  
+
   printf("Page counts:\n");
   printf("  Header says:           %u pages\n", g.headerPageCount);
   printf("  File size calculates:  %u pages\n", g.mxPage);
@@ -714,7 +839,7 @@ static void printReport(void){
     printf("  ⚠️  MISMATCH: %+d pages\n", (int)g.mxPage - (int)g.headerPageCount);
   }
   printf("\n");
-  
+
   printf("Page counts by type:\n");
   printf("  Freelist Trunk:        %5u\n", counts[PAGE_FREELIST_TRUNK]);
   printf("  Freelist Leaf:         %5u\n", counts[PAGE_FREELIST_LEAF]);
@@ -726,7 +851,7 @@ static void printReport(void){
   printf("  Pointer Map:           %5u\n", counts[PAGE_PTRMAP]);
   printf("  Lock-byte:             %5u\n", counts[PAGE_LOCKBYTE]);
   printf("\n");
-  
+
   /* Orphaned pages breakdown */
   u32 orphanBtreeLeafTable = counts[PAGE_ORPHAN_BTREE_LEAF_TABLE];
   u32 orphanBtreeLeafIndex = counts[PAGE_ORPHAN_BTREE_LEAF_INDEX];
@@ -734,10 +859,10 @@ static void printReport(void){
   u32 orphanBtreeInteriorIndex = counts[PAGE_ORPHAN_BTREE_INTERIOR_INDEX];
   u32 orphanOverflow = counts[PAGE_ORPHAN_OVERFLOW];
   u32 orphanEmpty = counts[PAGE_ORPHAN_EMPTY];
-  u32 totalOrphan = orphanBtreeLeafTable + orphanBtreeLeafIndex + 
+  u32 totalOrphan = orphanBtreeLeafTable + orphanBtreeLeafIndex +
                     orphanBtreeInteriorTable + orphanBtreeInteriorIndex +
                     orphanOverflow + orphanEmpty;
-  
+
   if(totalOrphan > 0){
     printf("Orphaned (unaccounted) pages:\n");
     printf("  Orphan Btree Leaf Table:      %5u\n", orphanBtreeLeafTable);
@@ -750,15 +875,15 @@ static void printReport(void){
     printf("  Total orphaned:               %5u\n", totalOrphan);
     printf("\n");
   }
-  
+
   printf("  UNKNOWN/Unclassified:  %5u\n", counts[PAGE_UNKNOWN]);
   printf("  ────────────────────────────\n");
   printf("  Total:                 %5u\n", g.mxPage);
-  
+
   u32 totalFreelist = counts[PAGE_FREELIST_TRUNK] + counts[PAGE_FREELIST_LEAF];
   u32 totalBtree = counts[PAGE_BTREE_INTERIOR_INDEX] + counts[PAGE_BTREE_INTERIOR_TABLE] +
                    counts[PAGE_BTREE_LEAF_INDEX] + counts[PAGE_BTREE_LEAF_TABLE];
-  u32 totalAccounted = totalFreelist + totalBtree + counts[PAGE_OVERFLOW] + 
+  u32 totalAccounted = totalFreelist + totalBtree + counts[PAGE_OVERFLOW] +
                        counts[PAGE_PTRMAP] + counts[PAGE_LOCKBYTE] + totalOrphan;
 
   printf("\n");
@@ -766,11 +891,11 @@ static void printReport(void){
   printf("  Total freelist pages:  %u (header says %u)\n", totalFreelist, g.freelistCount);
   printf("  Total btree pages:     %u\n", totalBtree);
   printf("  Total overflow pages:  %u\n", counts[PAGE_OVERFLOW]);
-  
+
   if(totalOrphan > 0){
-    printf("  Total orphaned pages:  %u (%.2f MB wasted)\n", 
+    printf("  Total orphaned pages:  %u (%.2f MB wasted)\n",
            totalOrphan, totalOrphan * g.pagesize / (1024.0 * 1024.0));
-    u32 orphanBtree = orphanBtreeLeafTable + orphanBtreeLeafIndex + 
+    u32 orphanBtree = orphanBtreeLeafTable + orphanBtreeLeafIndex +
                       orphanBtreeInteriorTable + orphanBtreeInteriorIndex;
     printf("    - Orphan btree:      %u (%.2f MB)\n",
            orphanBtree, orphanBtree * g.pagesize / (1024.0 * 1024.0));
@@ -781,13 +906,13 @@ static void printReport(void){
              orphanEmpty, orphanEmpty * g.pagesize / (1024.0 * 1024.0));
     }
   }
-  
+
   printf("  Total accounted for:   %u\n", totalAccounted);
   printf("  Total unclassified:    %u\n", counts[PAGE_UNKNOWN]);
-  
+
   if(totalFreelist != g.freelistCount){
     printf("\n⚠️  WARNING: Freelist count mismatch!\n");
-    printf("   Found %u freelist pages but header says %u\n", 
+    printf("   Found %u freelist pages but header says %u\n",
            totalFreelist, g.freelistCount);
     printf("   Difference: %d pages\n", (int)totalFreelist - (int)g.freelistCount);
   }
@@ -799,31 +924,40 @@ static void printReport(void){
     printf("   contain valid ptrmap data. These are remnants from when\n");
     printf("   autovacuum was previously enabled.\n");
   }
-  
+
   if(g.autoVacuum != 0 && counts[PAGE_PTRMAP] == 0){
     printf("\n⚠️  WARNING: Auto-vacuum enabled but NO ptrmap pages found!\n");
     printf("   This indicates database corruption.\n");
   }
-  
+
   if(g.autoVacuum != 0 && g.ptrmapMissingCount > 0){
     printf("\n⚠️  WARNING: Missing or invalid pointer map pages!\n");
     printf("   Auto-vacuum is ENABLED but %u pages at ptrmap positions\n", g.ptrmapMissingCount);
     printf("   are missing or contain invalid data.\n");
  }
-  
+
  /* Orphaned pages warning */
  if(totalOrphan > 0){
-   printf("\n⚠️  WARNING: %u ORPHANED page(s) found! (%.2f MB wasted)\n", 
+   printf("\n⚠️  WARNING: %u ORPHANED page(s) found! (%.2f MB wasted)\n",
           totalOrphan, totalOrphan * g.pagesize / (1024.0 * 1024.0));
    printf("   These pages contain data but are not referenced by any btree or freelist.\n");
-   printf("   This is likely due to interrupted DELETE operations or corruption.\n");
    printf("   Run VACUUM to reclaim this space.\n");
+
+   /* Write all orphaned pages to a file */
+   FILE *fp = fopen("orphaned_pages.txt", "w");
+   if(fp){
+     for(i=0; i<numOrphaned; i++){
+       fprintf(fp, "%u\n", orphanedPages[i]);
+     }
+     fclose(fp);
+     printf("   All %u orphaned pages written to: orphaned_pages.txt\n", numOrphaned);
+   }
  }
 
  if(counts[PAGE_UNKNOWN] > 0){
    printf("\n⚠️  WARNING: %u UNCLASSIFIED page(s) found!\n", counts[PAGE_UNKNOWN]);
     printf("   These pages are not in freelist, not in btrees, and not overflow.\n");
-    
+
     /* Write all unaccounted pages to a file */
     FILE *fp = fopen("unaccounted_pages.txt", "w");
     if(fp){
@@ -833,7 +967,7 @@ static void printReport(void){
       fclose(fp);
       printf("   All %u unaccounted pages written to: unaccounted_pages.txt\n", numUnknown);
     }
-    
+
     printf("   First %u unaccounted pages:\n", numUnknown < 20 ? numUnknown : 20);
     for(i=0; i<numUnknown && i<20; i++){
       printf("     Page %u\n", unknownPages[i]);
@@ -844,8 +978,9 @@ static void printReport(void){
   }else{
     printf("\n✓ All pages accounted for!\n");
   }
-  
+
   free(unknownPages);
+  free(orphanedPages);
 }
 
 /* Main */
@@ -887,7 +1022,7 @@ int main(int argc, char **argv){
     close(g.fd);
     return 1;
   }
-  
+
   printf("Marking pointer map pages...\n");
   markPtrmapPages();
 
